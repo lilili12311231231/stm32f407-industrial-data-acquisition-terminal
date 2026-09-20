@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>工业数据采集终端 - 监控大屏</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Microsoft YaHei", sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh; padding: 24px;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+    h1 { font-size: 26px; font-weight: 600; letter-spacing: 1px; text-align: center; }
+
+    #alarm-bar {
+      padding: 12px 20px; border-radius: 10px; text-align: center;
+      font-size: 15px; font-weight: 600; transition: all .3s;
+    }
+    #alarm-bar.ok { background: #052e16; color: #4ade80; border: 1px solid #14532d; }
+    #alarm-bar.alarm { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: .55; } }
+
+    .grid { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 14px;
+      padding: 22px 32px; text-align: center; min-width: 160px; flex: 1;
+    }
+    .card .label { font-size: 14px; color: #94a3b8; margin-bottom: 10px; }
+    .card .value { font-size: 36px; font-weight: 700; color: #38bdf8; }
+    .card .value .alarm { color: #f87171; }
+    .card .unit { font-size: 15px; color: #94a3b8; margin-left: 3px; }
+
+    .charts { display: flex; flex-direction: column; gap: 16px; }
+    .chart-box {
+      background: #1e293b; border: 1px solid #334155; border-radius: 14px;
+      padding: 14px 18px; height: 230px;
+    }
+    .chart-box .chart-title { font-size: 13px; color: #94a3b8; margin-bottom: 8px; }
+    .chart-wrap { position: relative; height: calc(100% - 26px); }
+
+    #status { font-size: 13px; color: #64748b; text-align: center; }
+    #status.ok { color: #4ade80; }
+    #status.err { color: #f87171; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>工业数据采集终端 · 监控大屏</h1>
+
+    <div id="alarm-bar" class="ok">运行正常</div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">电压</div>
+        <div class="value"><span id="voltage">--</span><span class="unit">V</span></div>
+      </div>
+      <div class="card">
+        <div class="label">温度</div>
+        <div class="value"><span id="temperature">--</span><span class="unit">℃</span></div>
+      </div>
+      <div class="card">
+        <div class="label">光强</div>
+        <div class="value"><span id="light">--</span><span class="unit">%</span></div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="chart-box">
+        <div class="chart-title">电压历史曲线（阈值 2.0V，低于报警）</div>
+        <div class="chart-wrap"><canvas id="chart-voltage"></canvas></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">温度历史曲线（阈值 40℃，高于报警）</div>
+        <div class="chart-wrap"><canvas id="chart-temperature"></canvas></div>
+      </div>
+      <div class="chart-box">
+        <div class="chart-title">光强历史曲线（阈值 20%，低于报警）</div>
+        <div class="chart-wrap"><canvas id="chart-light"></canvas></div>
+      </div>
+    </div>
+
+    <div id="status">等待数据…</div>
+  </div>
+
+  <script>
+    const socket = io();
+    const MAX_POINTS = 60;  // 保留最近 60 个点（60 秒）
+
+    const thresholds = { voltage: 2.0, temperature: 40.0, light: 20 };
+    const colors = {
+      voltage: { border: '#38bdf8', bg: 'rgba(56,189,248,0.15)' },
+      temperature: { border: '#fb923c', bg: 'rgba(251,146,60,0.15)' },
+      light: { border: '#4ade80', bg: 'rgba(74,222,128,0.15)' },
+    };
+
+    const buffers = { voltage: [], temperature: [], light: [] };
+    const labels = [];
+
+    function makeChart(canvasId, color, yMin, yMax) {
+      const ctx = document.getElementById(canvasId);
+      return new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            {  // 实时数据线（实线 + 半透明填充）
+              data: [],
+              borderColor: color.border,
+              backgroundColor: color.bg,
+              borderWidth: 2,
+              pointRadius: 0,
+              tension: 0.3,
+              fill: true,
+            },
+            {  // 报警阈值线（红色虚线）
+              data: [],
+              borderColor: 'rgba(248,113,113,0.9)',
+              borderDash: [6, 4],
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,  // 实时刷新关掉动画，避免闪烁
+          interaction: { intersect: false, mode: 'index' },
+          scales: {
+            x: {
+              ticks: { maxTicksLimit: 6, autoSkip: true, color: '#64748b' },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            },
+            y: {
+              min: yMin, max: yMax,
+              ticks: { color: '#94a3b8' },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            },
+          },
+          plugins: { legend: { display: false } },
+        },
+      });
+    }
+
+    const charts = {
+      voltage: makeChart('chart-voltage', colors.voltage, 0, 3.5),
+      temperature: makeChart('chart-temperature', colors.temperature, 20, 50),
+      light: makeChart('chart-light', colors.light, 0, 100),
+    };
+
+    function updateChart(chart, buffer, value, threshold) {
+      buffer.push(value);
+      if (buffer.length > MAX_POINTS) buffer.shift();
+      chart.data.labels = labels.slice();
+      chart.data.datasets[0].data = buffer.slice();
+      chart.data.datasets[1].data = buffer.map(() => threshold);
+      chart.update();
+    }
+
+    function setValue(id, text, isAlarm) {
+      const el = document.getElementById(id);
+      el.textContent = text;
+      el.classList.toggle('alarm', isAlarm);
+    }
+
+    function updateAlarmBar(alarm) {
+      const bar = document.getElementById('alarm-bar');
+      const parts = [];
+      if (alarm.voltage) parts.push('电压欠压');
+      if (alarm.temperature) parts.push('温度过高');
+      if (alarm.light) parts.push('光强过暗');
+      if (parts.length > 0) {
+        bar.textContent = '报警：' + parts.join('、');
+        bar.className = 'alarm';
+      } else {
+        bar.textContent = '运行正常';
+        bar.className = 'ok';
+      }
+    }
+
+    socket.on('data', (d) => {
+      labels.push(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+      if (labels.length > MAX_POINTS) labels.shift();
+
+      setValue('voltage', d.voltage.toFixed(2), d.alarm.voltage);
+      setValue('temperature', d.temperature.toFixed(1), d.alarm.temperature);
+      setValue('light', d.light, d.alarm.light);
+
+      updateChart(charts.voltage, buffers.voltage, d.voltage, thresholds.voltage);
+      updateChart(charts.temperature, buffers.temperature, d.temperature, thresholds.temperature);
+      updateChart(charts.light, buffers.light, d.light, thresholds.light);
+
+      updateAlarmBar(d.alarm);
+
+      const st = document.getElementById('status');
+      st.textContent = '连接正常，数据实时更新中…';
+      st.className = 'ok';
+    });
+
+    socket.on('error', (e) => {
+      const st = document.getElementById('status');
+      st.textContent = '读数据出错：' + e.message;
+      st.className = 'err';
+    });
+  </script>
+</body>
+</html>
